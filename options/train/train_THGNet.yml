@@ -1,0 +1,118 @@
+# general settings
+name: THGNet
+model_type: VideoRecurrentModel
+scale: 4
+num_gpu: 2  # set num_gpu: 0 for cpu mode
+manual_seed: 0
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: REDS
+    type: REDSRecurrentDataset
+    dataroot_gt: /mnt/data0/VSR/SAT-MAT-VSR/train/GT     #path/to/train/GT
+    dataroot_lq: /mnt/data0/VSR/SAT-MAT-VSR/train/LR4xBicubic   #path/to/train/LR4xBicubic
+    meta_info_file: /mnt/data0/VSR/SAT-MAT-VSR/train/meta_info_GT_train.txt #path/to/meta_info_GT_train.txt
+    val_partition: REDS4  # you should modify the file of REDS4 to load Jilin12
+    test_mode: False
+    io_backend:
+      type: disk
+
+    num_frame: 30 
+    gt_size: 256
+    interval_list: [1]
+    random_reverse: false
+    use_hflip: true
+    use_rot: true
+
+    # data loader
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 4
+    dataset_enlarge_ratio: 200
+    prefetch_mode: ~
+
+  val:
+    name: REDS4
+    type: VideoRecurrentTestDataset
+    dataroot_gt: /mnt/data0/VSR/SAT-MAT-VSR/val/GT
+    dataroot_lq: /mnt/data0/VSR/SAT-MAT-VSR/val/LR4xBicubic
+    cache_data: True
+    io_backend:
+      type: disk
+
+    num_frame: -1  # not needed
+
+# network structures
+network_g:
+  type: THGNet
+  #num_feat: 64
+  #num_block: 7
+  #keyframe_stride: 5
+  #temporal_padding: 2
+  spynet_path: /path/to/spynet_sintel_final-3d2a1287.pth
+  MAE_path: ~         #path/to/pretrained/MAE.pth
+
+
+# path
+path:
+  experiments_root: ~ #your experiments root path, if not set, it will be set as ./experiments
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+# training settings
+train:
+  ema_decay: 0.999
+  optim_g:
+    type: Adam
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000]
+    restart_weights: [1]
+    eta_min: !!float 1e-7
+
+  total_iter: 100000
+  warmup_iter: -1  # no warm up
+  fix_flow: 5000
+  flow_lr_mul: 0.25
+
+  # losses
+  pixel_opt:
+    type: CharbonnierLoss
+    loss_weight: 1.0
+    reduction: mean
+
+# validation settings
+val:
+  val_freq: !!float 1e3
+  save_img: false
+
+  metrics:
+    psnr: # metric name, can be arbitrary
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: false
+    ssim: # metric name, can be arbitrary
+      type: calculate_ssim
+      crop_border: 0
+      test_y_channel: false
+
+# logging settings
+logger:
+  print_freq: 100
+  save_checkpoint_freq: !!float 1e3
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
+
+find_unused_parameters: True
