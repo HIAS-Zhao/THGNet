@@ -83,10 +83,11 @@ class SCAMAttention(nn.Module):
 
 class OffsetPredictor(nn.Module):
     """Predict offsets from the reference and supporting frames using global + local prediction, with attention added to the global branch."""
-    def __init__(self, n_feats=64, deform_groups=8, kernel_size=3, in_channels=None):
+    def __init__(self, n_feats=64, deform_groups=8, kernel_size=3, in_channels=None, local_dilations=(1, 2, 3)):
         super(OffsetPredictor, self).__init__()
         self.kernel_size = kernel_size
         self.deform_groups = deform_groups
+        self.local_dilations = local_dilations
 
         # [MOD] in_channels must match the actual input channels:
         #       The BasicVSR++ alignment predictor input is [cond(3C) + flow1(2) + flow2(2)] => 3C + 4
@@ -108,15 +109,15 @@ class OffsetPredictor(nn.Module):
 
         # Three branches of the dilated convolution pyramid
         self.dilation1 = nn.Sequential(
-            nn.Conv2d(n_feats // 2, n_feats // 4, 3, padding=1, dilation=1),
+            nn.Conv2d(n_feats // 2, n_feats // 4, 3, padding=local_dilations[0], dilation=local_dilations[0]),
             nn.ReLU(inplace=True)
         )
         self.dilation2 = nn.Sequential(
-            nn.Conv2d(n_feats // 2, n_feats // 4, 3, padding=2, dilation=2),
+            nn.Conv2d(n_feats // 2, n_feats // 4, 3, padding=local_dilations[1], dilation=local_dilations[1]),
             nn.ReLU(inplace=True)
         )
         self.dilation3 = nn.Sequential(
-            nn.Conv2d(n_feats // 2, n_feats // 4, 3, padding=3, dilation=3),
+            nn.Conv2d(n_feats // 2, n_feats // 4, 3, padding=local_dilations[2], dilation=local_dilations[2]),
             nn.ReLU(inplace=True)
         )
 
@@ -155,11 +156,12 @@ class OffsetPredictor(nn.Module):
 
 class HighFreqEnhancer(nn.Module):
     """High-frequency enhancement for blur+compression degradation:
-       use mild high-pass: hf = x - gaussian_blur(x), then gated fusion.
+       extract high-frequency cues, then inject them with gated fusion.
     """
-    def __init__(self, mid_channels=64, ksize=5, sigma=1.0):
+    def __init__(self, mid_channels=64, ksize=5, sigma=1.0, hf_type="gaussian"):
         super().__init__()
         self.ksize = ksize
+        self.hf_type = hf_type
 
         # fixed gaussian kernel (not trainable)
         grid = torch.arange(ksize).float() - (ksize - 1) / 2
@@ -167,6 +169,34 @@ class HighFreqEnhancer(nn.Module):
         g = (g / g.sum()).view(1, 1, -1)  # [1,1,K]
         k2d = (g.transpose(2, 1) @ g).view(1, 1, ksize, ksize)  # [1,1,K,K]
         self.register_buffer("gauss", k2d)
+
+        lap = torch.tensor(
+            [[0, -1, 0],
+             [-1, 4, -1],
+             [0, -1, 0]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer("laplacian", lap)
+
+        sobel_x = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1, -2, -1],
+             [0, 0, 0],
+             [1, 2, 1]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+        if hf_type == "learned":
+            self.learned_hf = nn.Conv2d(3, 3, 3, 1, 1, groups=3, bias=False)
+            with torch.no_grad():
+                self.learned_hf.weight.copy_(lap.repeat(3, 1, 1, 1))
 
         # encode hf image -> feature space
         self.hf_encoder = nn.Sequential(
@@ -189,9 +219,30 @@ class HighFreqEnhancer(nn.Module):
         pad = self.ksize // 2
         return F.conv2d(x, k, padding=pad, groups=3)
 
+    def _laplacian(self, x):
+        k = self.laplacian.repeat(3, 1, 1, 1)
+        return F.conv2d(x, k, padding=1, groups=3)
+
+    def _sobel(self, x):
+        kx = self.sobel_x.repeat(3, 1, 1, 1)
+        ky = self.sobel_y.repeat(3, 1, 1, 1)
+        gx = F.conv2d(x, kx, padding=1, groups=3)
+        gy = F.conv2d(x, ky, padding=1, groups=3)
+        return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+    def _extract_hf(self, x):
+        if self.hf_type == "gaussian":
+            return x - self._blur(x)
+        if self.hf_type == "laplacian":
+            return self._laplacian(x)
+        if self.hf_type == "sobel":
+            return self._sobel(x)
+        if self.hf_type == "learned":
+            return self.learned_hf(x)
+        raise ValueError(f"Unsupported hf_type: {self.hf_type}")
+
     def forward(self, x_rgb, feat):
-        # mild high-pass
-        hf = x_rgb - self._blur(x_rgb)          # [B,3,H,W]
+        hf = self._extract_hf(x_rgb)            # [B,3,H,W]
         hf_feat = self.hf_encoder(hf)           # [B,C,H,W]
         g = self.gate(feat)                     # [B,C,H,W]
         return feat + self.scale * g * hf_feat
@@ -234,12 +285,16 @@ class THGNet(nn.Module):
                  is_low_res_input=True,
                  spynet_path=None,
                  MAE_path=None,
+                 hf_type="gaussian",
+                 use_hfe=True,
+                 use_gloe=True,
                  cpu_cache_length=100):
 
         super().__init__()
         self.mid_channels = mid_channels
         self.is_low_res_input = is_low_res_input
         self.cpu_cache_length = cpu_cache_length
+        self.use_hfe = use_hfe
 
         # optical flow
         self.spynet = SpyNet(spynet_path)
@@ -265,7 +320,8 @@ class THGNet(nn.Module):
                     3,
                     padding=1,
                     deformable_groups=16,
-                    max_residue_magnitude=max_residue_magnitude)
+                    max_residue_magnitude=max_residue_magnitude,
+                    use_gloe=use_gloe)
             self.backbone[module] = ConvResidualBlocks((2 + i) * mid_channels, mid_channels, num_blocks)
 
         # upsampling module
@@ -283,7 +339,8 @@ class THGNet(nn.Module):
         # activation function
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
-        self.hf_enhance = HighFreqEnhancer(mid_channels)
+        if self.use_hfe:
+            self.hf_enhance = HighFreqEnhancer(mid_channels, hf_type=hf_type)
 
         # check if the sequence is augmented by flipping
         self.is_mirror_extended = False
@@ -500,13 +557,15 @@ class THGNet(nn.Module):
             for i in range(0, t):
                 x_i = lqs[:, i, :, :, :]
                 feat = self.feat_extract(x_i)
-                feat = self.hf_enhance(x_i, feat)     # [ADD] High-frequency enhancement
+                if self.use_hfe:
+                    feat = self.hf_enhance(x_i, feat)
                 feats['spatial'].append(feat.cpu())
                 torch.cuda.empty_cache()
         else:
             lqs_ = lqs.view(-1, c, h, w)
             feats_ = self.feat_extract(lqs_)
-            feats_ = self.hf_enhance(lqs_, feats_)   # [ADD] Batch enhancement
+            if self.use_hfe:
+                feats_ = self.hf_enhance(lqs_, feats_)
             h, w = feats_.shape[2:]
             feats_ = feats_.view(n, t, -1, h, w)
             feats['spatial'] = [feats_[:, i, :, :, :] for i in range(0, t)]
@@ -559,16 +618,27 @@ class SecondOrderDeformableAlignment(ModulatedDeformConvPack):
 
     def __init__(self, *args, **kwargs):
         self.max_residue_magnitude = kwargs.pop('max_residue_magnitude', 10)
+        self.use_gloe = kwargs.pop('use_gloe', True)
 
         super(SecondOrderDeformableAlignment, self).__init__(*args, **kwargs)
 
-        # [MOD] Replace the original conv_offset with your OffsetPredictor, and set the input channels to 3C + 4
-        self.conv_offset = OffsetPredictor(
-            n_feats=self.out_channels,
-            deform_groups=self.deformable_groups,
-            kernel_size=3,
-            in_channels=3 * self.out_channels + 4
-        )
+        if self.use_gloe:
+            self.conv_offset = OffsetPredictor(
+                n_feats=self.out_channels,
+                deform_groups=self.deformable_groups,
+                kernel_size=3,
+                in_channels=3 * self.out_channels + 4
+            )
+        else:
+            self.conv_offset = nn.Sequential(
+                nn.Conv2d(3 * self.out_channels + 4, self.out_channels, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.1, inplace=True),
+                nn.Conv2d(self.out_channels, self.out_channels, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.1, inplace=True),
+                nn.Conv2d(self.out_channels, self.out_channels, 3, 1, 1),
+                nn.LeakyReLU(negative_slope=0.1, inplace=True),
+                nn.Conv2d(self.out_channels, 27 * self.deformable_groups, 3, 1, 1),
+            )
 
         self.init_offset()
 
@@ -580,8 +650,8 @@ class SecondOrderDeformableAlignment(ModulatedDeformConvPack):
             if hasattr(module, 'bias') and module.bias is not None:
                 nn.init.constant_(module.bias, bias)
 
-        # [MOD] conv_offset is no longer the original nn.Sequential, so constant initialization is not applied to conv_offset[-1]
-        # _constant_init(self.conv_offset[-1], val=0, bias=0)
+        if not self.use_gloe:
+            _constant_init(self.conv_offset[-1], val=0, bias=0)
 
     def forward(self, x, extra_feat, flow_1, flow_2):
         # [MOD] The predictor input must be [B, 3C+4, H, W], consistent with the original version
@@ -621,5 +691,3 @@ if __name__ == '__main__':
     print("FLOPs: {} G".format(flops/1e9))
     print(torch.cuda.is_available())
     print(list(model.deform_align.keys()))
-
-

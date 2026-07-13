@@ -2,7 +2,7 @@ import os
 import glob
 import time
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from collections import defaultdict
 import sys
 sys.path.insert(0, '/path/to/THGNet')
@@ -265,6 +265,12 @@ class TrainConfig:
     lr_crop_size: int = 160
     hr_crop_size: int = 640
 
+    save_latest_full: bool = True
+    save_best_full: bool = True
+    save_epoch_full: bool = True
+    full_ckpt_interval: int = 10
+    save_optimizer_state: bool = True
+
 
 def collect_all_seqs(hr_dir: str):
     exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
@@ -275,6 +281,22 @@ def collect_all_seqs(hr_dir: str):
     return sorted({os.path.relpath(p, hr_dir).split(os.sep)[0] for p in hr_files})
 
 
+def get_arch_config(cfg: TrainConfig):
+    return {
+        "type": "TemporalNeighborFeatureMAE_SR",
+        "encoder_type": "ConvResidualBlocks",
+        "in_channels": 3,
+        "mid_channels": cfg.mid_channels,
+        "enc_num_blocks": cfg.enc_num_blocks,
+        "block_size": cfg.block_size,
+        "mask_ratio": cfg.mask_ratio,
+        "neighbor_mask_ratio": cfg.neighbor_mask_ratio,
+        "num_frames": cfg.num_frames,
+        "lr_crop_size": cfg.lr_crop_size,
+        "hr_crop_size": cfg.hr_crop_size,
+    }
+
+
 def save_best_encoder(path: str, encoder_state: dict, epoch: int, best_psnr: float, cfg: TrainConfig):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
@@ -282,16 +304,43 @@ def save_best_encoder(path: str, encoder_state: dict, epoch: int, best_psnr: flo
         "best_mean_psnr": best_psnr,
         "encoder_state_dict": encoder_state,
         "seed": cfg.seed,
-        "arch": {
-            "type": "ConvResidualBlocks",
-            "pretrain": "TemporalNeighborFeatureMAE_SR",
-            "in_channels": 3,
-            "out_channels": cfg.mid_channels,
-            "num_blocks": cfg.enc_num_blocks,
-            "num_frames": cfg.num_frames,
-            "neighbor_mask_ratio": cfg.neighbor_mask_ratio,
-        }
+        "arch": get_arch_config(cfg),
+        "cfg": asdict(cfg),
     }, path)
+
+
+def save_full_checkpoint(
+    path: str,
+    model,
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_epoch: int,
+    mean_psnr: float,
+    best_mean_psnr: float,
+    train_loss: float,
+    cfg: TrainConfig,
+    seq_psnr=None,
+):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    raw_model = unwrap_model(model)
+    checkpoint = {
+        "epoch": epoch,
+        "best_epoch": best_epoch,
+        "mean_psnr": mean_psnr,
+        "best_mean_psnr": best_mean_psnr,
+        "train_loss": train_loss,
+        "model_state_dict": raw_model.state_dict(),
+        "encoder_state_dict": raw_model.encoder.state_dict(),
+        "seed": cfg.seed,
+        "arch": get_arch_config(cfg),
+        "cfg": asdict(cfg),
+        "seq_psnr": seq_psnr,
+    }
+    if cfg.save_optimizer_state:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(checkpoint, path)
 
 
 def main():
@@ -399,6 +448,9 @@ def main():
     best_mean_psnr = -1e9
     best_epoch = -1
     best_path = os.path.join(cfg.save_dir, "best_encoder.pth")
+    best_full_path = os.path.join(cfg.save_dir, "best_full_model.pth")
+    latest_full_path = os.path.join(cfg.save_dir, "latest_full_model.pth")
+    epoch_ckpt_dir = os.path.join(cfg.save_dir, "full_checkpoints")
     epochs_without_improvement = 0
 
     if is_main_process(rank):
@@ -466,7 +518,24 @@ def main():
                         cfg=cfg
                     )
 
+                    if cfg.save_best_full:
+                        save_full_checkpoint(
+                            path=best_full_path,
+                            model=model,
+                            optimizer=optim,
+                            scheduler=sched,
+                            epoch=epoch,
+                            best_epoch=best_epoch,
+                            mean_psnr=mean_psnr,
+                            best_mean_psnr=best_mean_psnr,
+                            train_loss=train_loss,
+                            cfg=cfg,
+                            seq_psnr=seq_psnr,
+                        )
+
                     print(f"  New BEST! epoch={epoch}, best_mean_psnr={best_mean_psnr:.3f} -> saved {best_path}")
+                    if cfg.save_best_full:
+                        print(f"  Saved full T-MAE checkpoint: {best_full_path}")
                     for seq_name in sorted(seq_psnr.keys()):
                         print(f"    ValSeq {seq_name}: PSNR={seq_psnr[seq_name]:.3f}")
                 else:
@@ -477,6 +546,42 @@ def main():
                     )
 
                 print(f"  Current BEST: epoch={best_epoch}, best_mean_psnr={best_mean_psnr:.3f}")
+
+                if cfg.save_latest_full:
+                    save_full_checkpoint(
+                        path=latest_full_path,
+                        model=model,
+                        optimizer=optim,
+                        scheduler=sched,
+                        epoch=epoch,
+                        best_epoch=best_epoch,
+                        mean_psnr=mean_psnr,
+                        best_mean_psnr=best_mean_psnr,
+                        train_loss=train_loss,
+                        cfg=cfg,
+                        seq_psnr=seq_psnr,
+                    )
+
+                if (
+                    cfg.save_epoch_full
+                    and cfg.full_ckpt_interval > 0
+                    and (epoch % cfg.full_ckpt_interval == 0 or epoch == cfg.epochs)
+                ):
+                    epoch_full_path = os.path.join(epoch_ckpt_dir, f"epoch_{epoch:03d}_full_model.pth")
+                    save_full_checkpoint(
+                        path=epoch_full_path,
+                        model=model,
+                        optimizer=optim,
+                        scheduler=sched,
+                        epoch=epoch,
+                        best_epoch=best_epoch,
+                        mean_psnr=mean_psnr,
+                        best_mean_psnr=best_mean_psnr,
+                        train_loss=train_loss,
+                        cfg=cfg,
+                        seq_psnr=seq_psnr,
+                    )
+                    print(f"  Saved periodic full T-MAE checkpoint: {epoch_full_path}")
 
                 stop_flag = 1.0 if epochs_without_improvement >= cfg.early_stop_patience else 0.0
                 if stop_flag > 0:
@@ -497,6 +602,10 @@ def main():
         if is_main_process(rank):
             print(f"Training done. Best epoch={best_epoch}, best folder-avg PSNR={best_mean_psnr:.3f}")
             print("Best encoder path:", best_path)
+            if cfg.save_best_full:
+                print("Best full T-MAE path:", best_full_path)
+            if cfg.save_latest_full:
+                print("Latest full T-MAE path:", latest_full_path)
     finally:
         cleanup_distributed(is_distributed)
 
