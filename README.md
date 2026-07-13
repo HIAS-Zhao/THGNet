@@ -137,9 +137,15 @@ THGNet/
    
 
 ## Pretrained Models
-The pretrained SPyNet weights
+
+1. SAT-MAT-VSR  
+
+    ```bash
+    T-MAE Encoder: "\THGNet\experiments\pretrained_models\best_encoder_SMV.pth" 
     ```
-    "/THGNet/experiments/pretrained_models/spynet_sintel_final-3d2a1287.pth"
+2. CQ1-VSR   
+    ```bash 
+    T-MAE Encoder: "\THGNet\experiments\pretrained_models\best_encoder_CQ1-VSR.pth" 
     ```
 ## Training
 - Single GPU
