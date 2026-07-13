@@ -140,7 +140,6 @@ THGNet/
 The pretrained SPyNet weights
     ```bash
     "/THGNet/experiments/pretrained_models/spynet_sintel_final-3d2a1287.pth"
-   
     ```
 ## Training
 - Single GPU
