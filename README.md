@@ -4,32 +4,27 @@
 
 Official PyTorch implementation of **THGNet: Improving Temporal Alignment and Feature Representation for Remote Sensing Video Super-Resolution**.
 
-This paper has been submitted to **IEEE Transactions on Geoscience and Remote Sensing (IEEE TGRS)**.
 
 ## Abstract
-Remote sensing video super-resolution recon
-structs high-resolution satellite video sequences from low
-resolution observations. A central difficulty of this task is
-temporal alignment: satellite videos often contain platform
-induced frame-level displacement, residual jitter, weak tex
-tures, and local structural variations, so useful cross-frame
-information can be blurred or misaggregated when alignment
-is inaccurate. This paper presents THGNet, a remote sens
-ing VSR framework built on a recurrent backbone. Its key
-component is the Global-Local Offsets Estimator (GLOE),
-which refines second-order deformable alignment through com
-plementary global-context recalibration and multi-scale local
-offset refinement. To support this alignment-centered design, an
-MAE-inspired temporal feature-masking pretraining strategy
-(T-MAE) provides a context-sensitive encoder initialization,
-and the High-Frequency Enhancement (HFE) module injects
-gated high-pass cues before temporal propagation. We also
-construct CQ1-VSR from raw unregistered satellite source
-videos to complement preprocessed benchmarks with stronger
-inter-frame variation. Under the reported comparison settings,
-THGNet achieves the best performance among the compared
-methods, reaching 39.68 dB PSNR on SAT-MAT-VSR and
-41.40 dB on CQ1-VSR with 8.2M parameters.
+Remote sensing video super-resolution reconstructs high-resolution satellite
+video sequences from low-resolution observations, supporting applied earth
+observation tasks that depend on fine structures, such as road-network
+interpretation and vehicle and aircraft inspection. A central difficulty is
+temporal alignment: satellite videos often contain platform-induced
+frame-level displacement, residual jitter, weak textures, and local structural
+variations, so useful cross-frame information can be blurred or misaggregated
+when alignment is inaccurate. This paper presents THGNet, a recurrent video
+super-resolution framework. Its key component, the Global-Local Offsets
+Estimator, refines second-order deformable alignment through complementary
+global-context recalibration and multi-scale local offset refinement. An
+MAE-inspired temporal feature-masking pretraining strategy provides a
+context-sensitive initialization for the encoder, and a High-Frequency
+Enhancement module injects gated high-pass cues before temporal propagation.
+We also construct CQ1-VSR from raw unregistered satellite source videos to
+complement preprocessed benchmarks with stronger inter-frame variation. THGNet
+achieves the best performance among the compared methods, reaching 39.68 dB
+PSNR on SAT-MAT-VSR and 41.40 dB on CQ1-VSR with a compact 8.2M-parameter
+model that runs at a real-time speed of 54 FPS.
 
 ## Network  
 ![Network](assets/Overview.png)
